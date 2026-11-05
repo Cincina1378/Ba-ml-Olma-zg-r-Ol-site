@@ -1,221 +1,209 @@
 import os
-import random
+import secrets
 import smtplib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
 
-from flask import (
-    Flask, render_template, request, redirect,
-    url_for, session, flash, abort
-)
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "yerel-gelistirme-anahtari")
-database_url = os.environ.get("DATABASE_URL", "sqlite:///kitap.db")
-
+database_url = os.environ.get("DATABASE_URL", "sqlite:///site.db")
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 db = SQLAlchemy(app)
 
 ADMIN_EMAIL = "tfyebirligiedittvshorts@gmail.com"
-SENDER_EMAIL = os.environ.get("MAIL_USERNAME", "bbagimliolmaozgurol@gmail.com")
+SENDER_EMAIL = "bbagimliolmaozgurol@gmail.com"
 
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(200), unique=True, nullable=False)
-    display_name = db.Column(db.String(80), default="Okuyucu")
-    profile_photo = db.Column(db.String(500), default="")
-    password_hash = db.Column(db.String(300), nullable=True)
-    is_authorized = db.Column(db.Boolean, default=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    display_name = db.Column(db.String(100), default="Üye")
+    profile_photo = db.Column(db.String(1000), default="")
+    authorized = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 class LoginCode(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(200), nullable=False)
-    code_hash = db.Column(db.String(300), nullable=False)
+    email = db.Column(db.String(255), nullable=False)
+    code_hash = db.Column(db.String(255), nullable=False)
     expires_at = db.Column(db.DateTime, nullable=False)
 
 
-class SupportTicket(db.Model):
+class Ticket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    subject = db.Column(db.String(150), nullable=False)
+    title = db.Column(db.String(150), nullable=False)
     status = db.Column(db.String(20), default="open")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    user = db.relationship("User")
 
 
-class SupportMessage(db.Model):
+class TicketMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    ticket_id = db.Column(db.Integer, db.ForeignKey("support_ticket.id"), nullable=False)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("ticket.id"), nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    message = db.Column(db.String(2000), nullable=False)
+    message = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    user = db.relationship("User")
+
+
+def send_email(to, subject, body):
+    username = os.environ.get("MAIL_USERNAME", SENDER_EMAIL)
+    password = os.environ.get("MAIL_PASSWORD")
+    server = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
+    port = int(os.environ.get("MAIL_PORT", "587"))
+
+    if not password:
+        raise RuntimeError("MAIL_PASSWORD ayarlanmamış.")
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = username
+    message["To"] = to
+    message.set_content(body)
+
+    with smtplib.SMTP(server, port) as smtp:
+        smtp.starttls()
+        smtp.login(username, password)
+        smtp.send_message(message)
 
 
 def current_user():
     user_id = session.get("user_id")
-    return db.session.get(User, user_id) if user_id else None
+    if not user_id:
+        return None
+    return db.session.get(User, user_id)
 
 
-def is_admin():
-    user = current_user()
-    return bool(user and user.email.lower() == ADMIN_EMAIL.lower())
-
-
-def can_manage_support():
-    user = current_user()
-    return bool(user and (is_admin() or user.is_authorized))
-
-
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
+def login_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
         if not current_user():
             return redirect(url_for("login"))
-        return view(*args, **kwargs)
-    return wrapped
+        return function(*args, **kwargs)
+    return wrapper
 
 
-def admin_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not is_admin():
-            abort(403)
-        return view(*args, **kwargs)
-    return wrapped
+def authorized_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or (user.email != ADMIN_EMAIL and not user.authorized):
+            flash("Bu sayfaya erişim yetkiniz yok.")
+            return redirect(url_for("index"))
+        return function(*args, **kwargs)
+    return wrapper
 
 
-def send_email(to, subject, body):
-    host = os.environ.get("MAIL_SERVER")
-    username = os.environ.get("MAIL_USERNAME")
-    password = os.environ.get("MAIL_PASSWORD")
-
-    if not all([host, username, password]):
-        raise RuntimeError("E-posta ayarları henüz yapılmadı.")
-
-    message = EmailMessage()
-    message["From"] = username
-    message["To"] = to
-    message["Subject"] = subject
-    message.set_content(body)
-
-    with smtplib.SMTP(host, int(os.environ.get("MAIL_PORT", "587"))) as server:
-        server.starttls()
-        server.login(username, password)
-        server.send_message(message)
+def admin_required(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or user.email != ADMIN_EMAIL:
+            flash("Yönetici erişimi gerekli.")
+            return redirect(url_for("index"))
+        return function(*args, **kwargs)
+    return wrapper
 
 
 @app.context_processor
 def inject_user():
-    return {
-        "user": current_user(),
-        "admin": is_admin(),
-        "support_manager": can_manage_support()
-    }
+    return {"current_user": current_user()}
 
 
 @app.route("/")
-def home():
+def index():
     return render_template("index.html")
 
 
 @app.route("/giris", methods=["GET", "POST"])
 def login():
-    if current_user():
-        return redirect(url_for("home"))
-
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
 
         if not email or "@" not in email:
-            flash("Geçerli bir e-posta adresi gir.")
+            flash("Geçerli bir e-posta adresi girin.")
             return redirect(url_for("login"))
 
-        code = str(random.randint(100000, 999999))
+        code = f"{secrets.randbelow(1000000):06d}"
 
         LoginCode.query.filter_by(email=email).delete()
-        record = LoginCode(
+        login_code = LoginCode(
             email=email,
             code_hash=generate_password_hash(code),
             expires_at=datetime.utcnow() + timedelta(minutes=5)
         )
-        db.session.add(record)
+        db.session.add(login_code)
         db.session.commit()
 
         try:
             send_email(
                 email,
-                "Giriş doğrulama kodun",
-                f"Giriş kodun: {code}\nBu kod 5 dakika geçerlidir."
+                "Bağımlı Olma Özgür Ol! - Giriş kodu",
+                f"Giriş kodunuz: {code}\nBu kod 5 dakika geçerlidir."
             )
         except Exception:
-            db.session.delete(record)
+            db.session.delete(login_code)
             db.session.commit()
-            flash("E-posta gönderilemedi. Sistem ayarları kontrol edilmeli.")
+            flash("E-posta gönderilemedi. Ayarları kontrol edin.")
             return redirect(url_for("login"))
 
         session["pending_email"] = email
-        flash("Doğrulama kodu e-posta adresine gönderildi.")
         return redirect(url_for("verify"))
 
     return render_template("login.html")
 
 
-@app.route("/kod", methods=["GET", "POST"])
+@app.route("/dogrula", methods=["GET", "POST"])
 def verify():
     email = session.get("pending_email")
-
     if not email:
         return redirect(url_for("login"))
 
     if request.method == "POST":
         code = request.form.get("code", "").strip()
-        record = LoginCode.query.filter_by(email=email).first()
+        login_code = LoginCode.query.filter_by(email=email).first()
 
         if (
-            not record
-            or record.expires_at < datetime.utcnow()
-            or not check_password_hash(record.code_hash, code)
+            not login_code
+            or login_code.expires_at < datetime.utcnow()
+            or not check_password_hash(login_code.code_hash, code)
         ):
             flash("Kod hatalı veya süresi dolmuş.")
             return redirect(url_for("verify"))
 
         user = User.query.filter_by(email=email).first()
-
         if not user:
             user = User(email=email)
             db.session.add(user)
-            db.session.flush()
 
-        db.session.delete(record)
+        db.session.delete(login_code)
         db.session.commit()
 
         session.clear()
-        session["user_id"] = user.id
         session.permanent = True
+        session["user_id"] = user.id
 
-        return redirect(url_for("home"))
+        return redirect(url_for("index"))
 
     return render_template("verify.html")
 
 
 @app.route("/cikis")
-@login_required
 def logout():
     session.clear()
-    return redirect(url_for("home"))
+    return redirect(url_for("index"))
 
 
 @app.route("/profil", methods=["GET", "POST"])
@@ -224,154 +212,167 @@ def profile():
     user = current_user()
 
     if request.method == "POST":
-        name = request.form.get("display_name", "").strip()
-        photo = request.form.get("profile_photo", "").strip()
+        display_name = request.form.get("display_name", "").strip()
+        photo_url = request.form.get("profile_photo", "").strip()
 
-        if name:
-            user.display_name = name[:80]
+        if display_name:
+            user.display_name = display_name[:100]
 
-        user.profile_photo = photo[:500]
+        user.profile_photo = photo_url[:1000]
         db.session.commit()
-
         flash("Profil güncellendi.")
         return redirect(url_for("profile"))
 
-    return render_template("profile.html")
+    return render_template("profile.html", user=user)
 
 
-@app.route("/destek", methods=["GET", "POST"])
-@login_required
+@app.route("/kitap/<int:book_id>")
+def book(book_id):
+    return render_template("book.html", book_id=book_id)
+
+
+@app.route("/yonetim")
+@admin_required
+def admin():
+    users = User.query.order_by(User.created_at.desc()).all()
+    return render_template("admin.html", users=users)
+
+
+@app.route("/yonetim/yetki/<int:user_id>", methods=["POST"])
+@admin_required
+def change_authority(user_id):
+    user = db.session.get(User, user_id)
+
+    if not user:
+        flash("Kullanıcı bulunamadı.")
+        return redirect(url_for("admin"))
+
+    if user.email == ADMIN_EMAIL:
+        flash("Ana yöneticinin yetkisi değiştirilemez.")
+        return redirect(url_for("admin"))
+
+    user.authorized = not user.authorized
+    db.session.commit()
+    flash("Yetki güncellendi.")
+    return redirect(url_for("admin"))
+
+
+@app.route("/yonetim/duyuru", methods=["POST"])
+@admin_required
+def bulk_email():
+    subject = request.form.get("subject", "").strip()
+    body = request.form.get("message", "").strip()
+
+    if not subject or not body:
+        flash("Başlık ve mesaj gerekli.")
+        return redirect(url_for("admin"))
+
+    users = User.query.all()
+    sent = 0
+
+    for user in users:
+        try:
+            send_email(user.email, subject, body)
+            sent += 1
+        except Exception:
+            continue
+
+    flash(f"{sent} kişiye e-posta gönderildi.")
+    return redirect(url_for("admin"))
+
+
+@app.route("/destek")
+@authorized_required
 def support():
-    if not can_manage_support():
-        abort(403)
-
-    if request.method == "POST":
-        subject = request.form.get("subject", "").strip()
-
-        if subject:
-            ticket = SupportTicket(
-                user_id=current_user().id,
-                subject=subject[:150]
-            )
-            db.session.add(ticket)
-            db.session.commit()
-            return redirect(url_for("ticket", ticket_id=ticket.id))
-
-    tickets = SupportTicket.query.filter_by(status="open").order_by(
-        SupportTicket.created_at.desc()
-    ).all()
-
+    tickets = Ticket.query.order_by(Ticket.created_at.desc()).all()
     return render_template("support.html", tickets=tickets)
 
 
-@app.route("/destek/<int:ticket_id>", methods=["GET", "POST"])
-@login_required
-def ticket(ticket_id):
-    ticket_item = db.session.get(SupportTicket, ticket_id)
+@app.route("/destek/yeni", methods=["POST"])
+@authorized_required
+def create_ticket():
+    title = request.form.get("title", "").strip()
 
-    if not ticket_item:
-        abort(404)
+    if not title:
+        flash("Destek başlığı gerekli.")
+        return redirect(url_for("support"))
+
+    ticket = Ticket(user_id=current_user().id, title=title[:150])
+    db.session.add(ticket)
+    db.session.commit()
+
+    return redirect(url_for("ticket", ticket_id=ticket.id))
+
+
+@app.route("/destek/<int:ticket_id>")
+@authorized_required
+def ticket(ticket_id):
+    ticket = db.session.get(Ticket, ticket_id)
+
+    if not ticket:
+        return "Destek bulunamadı.", 404
 
     user = current_user()
-    allowed = (
-        ticket_item.user_id == user.id
-        or is_admin()
-        or user.is_authorized
-    )
+    if user.email != ADMIN_EMAIL and ticket.user_id != user.id:
+        return "Bu desteğe erişim izniniz yok.", 403
 
-    if not allowed:
-        abort(403)
+    messages = TicketMessage.query.filter_by(
+        ticket_id=ticket.id
+    ).order_by(TicketMessage.created_at.asc()).all()
 
-    if request.method == "POST":
-        message = request.form.get("message", "").strip()
+    return render_template("ticket.html", ticket=ticket, messages=messages)
 
-        if message and ticket_item.status == "open":
-            db.session.add(SupportMessage(
-                ticket_id=ticket_id,
-                user_id=user.id,
-                message=message[:2000]
-            ))
-            db.session.commit()
 
-        return redirect(url_for("ticket", ticket_id=ticket_id))
+@app.route("/destek/<int:ticket_id>/mesaj", methods=["POST"])
+@authorized_required
+def send_ticket_message(ticket_id):
+    ticket = db.session.get(Ticket, ticket_id)
 
-    messages = SupportMessage.query.filter_by(
-        ticket_id=ticket_id
-    ).order_by(SupportMessage.created_at.asc()).all()
+    if not ticket:
+        return "Destek bulunamadı.", 404
 
-    return render_template(
-        "ticket.html",
-        ticket=ticket_item,
-        messages=messages
-    )
+    user = current_user()
+    if user.email != ADMIN_EMAIL and ticket.user_id != user.id:
+        return "Bu desteğe erişim izniniz yok.", 403
+
+    if ticket.status != "open":
+        flash("Bu destek görüşmesi kapatılmış.")
+        return redirect(url_for("ticket", ticket_id=ticket.id))
+
+    message = request.form.get("message", "").strip()
+
+    if message:
+        db.session.add(TicketMessage(
+            ticket_id=ticket.id,
+            user_id=user.id,
+            message=message[:5000]
+        ))
+        db.session.commit()
+
+    return redirect(url_for("ticket", ticket_id=ticket.id))
 
 
 @app.route("/destek/<int:ticket_id>/kapat", methods=["POST"])
-@login_required
+@authorized_required
 def close_ticket(ticket_id):
-    ticket_item = db.session.get(SupportTicket, ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
 
-    if not ticket_item:
-        abort(404)
+    if not ticket:
+        return "Destek bulunamadı.", 404
 
     user = current_user()
+    if user.email != ADMIN_EMAIL and ticket.user_id != user.id:
+        return "Bu desteğe erişim izniniz yok.", 403
 
-    if not (
-        ticket_item.user_id == user.id
-        or is_admin()
-        or user.is_authorized
-    ):
-        abort(403)
-
-    ticket_item.status = "closed"
+    ticket.status = "closed"
     db.session.commit()
 
     return redirect(url_for("support"))
 
 
-@app.route("/yonetim", methods=["GET", "POST"])
-@admin_required
-def admin_panel():
-    if request.method == "POST":
-        action = request.form.get("action")
-
-        if action == "yetki":
-            user_id = request.form.get("user_id", type=int)
-            target = db.session.get(User, user_id)
-
-            if target and target.email.lower() != ADMIN_EMAIL.lower():
-                target.is_authorized = request.form.get("enabled") == "1"
-                db.session.commit()
-
-        elif action == "duyuru":
-            subject = request.form.get("subject", "").strip()
-            body = request.form.get("body", "").strip()
-
-            if subject and body:
-                recipients = User.query.with_entities(User.email).all()
-
-                for recipient in recipients:
-                    try:
-                        send_email(recipient[0], subject, body)
-                    except Exception:
-                        app.logger.exception("Duyuru gönderilemedi: %s", recipient[0])
-
-                flash("Duyuru gönderim işlemi tamamlandı.")
-
-        return redirect(url_for("admin_panel"))
-
-    users = User.query.order_by(User.created_at.desc()).all()
-    return render_template("admin.html", users=users)
-
-
-@app.errorhandler(403)
-def forbidden(error):
-    return render_template("error.html", message="Bu sayfaya erişim iznin yok."), 403
-
-
 @app.errorhandler(404)
 def not_found(error):
-    return render_template("error.html", message="Sayfa bulunamadı."), 404
+    return "Sayfa bulunamadı.", 404
 
 
 with app.app_context():
